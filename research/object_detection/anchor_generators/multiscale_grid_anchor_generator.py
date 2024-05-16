@@ -20,6 +20,8 @@ described in:
 T.-Y. Lin, P. Goyal, R. Girshick, K. He, P. Dollar
 """
 
+import tensorflow.compat.v1 as tf
+
 from object_detection.anchor_generators import grid_anchor_generator
 from object_detection.core import anchor_generator
 from object_detection.core import box_list_ops
@@ -58,7 +60,7 @@ class MultiscaleGridAnchorGenerator(anchor_generator.AnchorGenerator):
     self._normalize_coordinates = normalize_coordinates
 
     scales = [2**(float(scale) / scales_per_octave)
-              for scale in xrange(scales_per_octave)]
+              for scale in range(scales_per_octave)]
     aspects = list(aspect_ratios)
 
     for level in range(min_level, max_level + 1):
@@ -85,8 +87,10 @@ class MultiscaleGridAnchorGenerator(anchor_generator.AnchorGenerator):
   def _generate(self, feature_map_shape_list, im_height=1, im_width=1):
     """Generates a collection of bounding boxes to be used as anchors.
 
-    Currently we require the input image shape to be statically defined.  That
-    is, im_height and im_width should be integers rather than tensors.
+    For training, we require the input image shape to be statically defined.
+    That is, im_height and im_width should be integers rather than tensors.
+    For inference, im_height and im_width can be either integers (for fixed
+    image size), or tensors (for arbitrary image size).
 
     Args:
       feature_map_shape_list: list of pairs of convnet layer resolutions in the
@@ -108,9 +112,6 @@ class MultiscaleGridAnchorGenerator(anchor_generator.AnchorGenerator):
       ValueError: if im_height and im_width are 1, but normalized coordinates
         were requested.
     """
-    if not isinstance(im_height, int) or not isinstance(im_width, int):
-      raise ValueError('MultiscaleGridAnchorGenerator currently requires '
-                       'input image shape to be statically defined.')
     anchor_grid_list = []
     for feat_shape, grid_info in zip(feature_map_shape_list,
                                      self._anchor_grid_info):
@@ -122,9 +123,13 @@ class MultiscaleGridAnchorGenerator(anchor_generator.AnchorGenerator):
       feat_h = feat_shape[0]
       feat_w = feat_shape[1]
       anchor_offset = [0, 0]
-      if im_height % 2.0**level == 0 or im_height == 1:
+      if isinstance(im_height, int) and isinstance(im_width, int):
+        if im_height % 2.0**level == 0 or im_height == 1:
+          anchor_offset[0] = stride / 2.0
+        if im_width % 2.0**level == 0 or im_width == 1:
+          anchor_offset[1] = stride / 2.0
+      if tf.is_tensor(im_height) and tf.is_tensor(im_width):
         anchor_offset[0] = stride / 2.0
-      if im_width % 2.0**level == 0 or im_width == 1:
         anchor_offset[1] = stride / 2.0
       ag = grid_anchor_generator.GridAnchorGenerator(
           scales,

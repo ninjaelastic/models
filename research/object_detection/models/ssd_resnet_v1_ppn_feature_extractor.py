@@ -14,7 +14,8 @@
 # ==============================================================================
 """SSD feature extractors based on Resnet v1 and PPN architectures."""
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+import tf_slim as slim
 
 from object_detection.meta_architectures import ssd_meta_arch
 from object_detection.models import feature_map_generators
@@ -22,8 +23,6 @@ from object_detection.utils import context_manager
 from object_detection.utils import ops
 from object_detection.utils import shape_utils
 from nets import resnet_v1
-
-slim = tf.contrib.slim
 
 
 class _SSDResnetPpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
@@ -98,6 +97,8 @@ class _SSDResnetPpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
 
     VGG style channel mean subtraction as described here:
     https://gist.github.com/ksimonyan/211839e770f7b538e2d8#file-readme-mdnge.
+    Note that if the number of channels is not equal to 3, the mean subtraction
+    will be skipped and the original resized_inputs will be returned.
 
     Args:
       resized_inputs: a [batch, height, width, channels] float tensor
@@ -107,8 +108,11 @@ class _SSDResnetPpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
       preprocessed_inputs: a [batch, height, width, channels] float tensor
         representing a batch of images.
     """
-    channel_means = [123.68, 116.779, 103.939]
-    return resized_inputs - [[channel_means]]
+    if resized_inputs.shape.as_list()[3] == 3:
+      channel_means = [123.68, 116.779, 103.939]
+      return resized_inputs - [[channel_means]]
+    else:
+      return resized_inputs
 
   def extract_features(self, preprocessed_inputs):
     """Extract features from preprocessed inputs.
@@ -156,7 +160,7 @@ class _SSDResnetPpnFeatureExtractor(ssd_meta_arch.SSDFeatureExtractor):
             image_features={
                 'image_features': self._filter_features(activations)['block3']
             })
-    return feature_maps.values()
+    return list(feature_maps.values())
 
 
 class SSDResnet50V1PpnFeatureExtractor(_SSDResnetPpnFeatureExtractor):

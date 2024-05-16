@@ -14,10 +14,14 @@
 # ==============================================================================
 """Functions for reading and updating configuration files."""
 
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import os
-import tensorflow as tf
 
 from google.protobuf import text_format
+import tensorflow.compat.v1 as tf
 
 from tensorflow.python.lib.io import file_io
 
@@ -42,12 +46,13 @@ def get_image_resizer_config(model_config):
     ValueError: If the model type is not recognized.
   """
   meta_architecture = model_config.WhichOneof("model")
-  if meta_architecture == "faster_rcnn":
-    return model_config.faster_rcnn.image_resizer
-  if meta_architecture == "ssd":
-    return model_config.ssd.image_resizer
+  meta_architecture_config = getattr(model_config, meta_architecture)
 
-  raise ValueError("Unknown model type: {}".format(meta_architecture))
+  if hasattr(meta_architecture_config, "image_resizer"):
+    return getattr(meta_architecture_config, "image_resizer")
+  else:
+    raise ValueError("{} has no image_reszier_config".format(
+        meta_architecture))
 
 
 def get_spatial_image_size(image_resizer_config):
@@ -73,15 +78,55 @@ def get_spatial_image_size(image_resizer_config):
       return [image_resizer_config.keep_aspect_ratio_resizer.max_dimension] * 2
     else:
       return [-1, -1]
+  if image_resizer_config.HasField(
+      "identity_resizer") or image_resizer_config.HasField(
+          "conditional_shape_resizer"):
+    return [-1, -1]
   raise ValueError("Unknown image resizer type.")
 
 
-def get_configs_from_pipeline_file(pipeline_config_path):
+def get_max_num_context_features(model_config):
+  """Returns maximum number of context features from a given config.
+
+  Args:
+    model_config: A model config file.
+
+  Returns:
+    An integer specifying the max number of context features if the model
+      config contains context_config, None otherwise
+
+  """
+  meta_architecture = model_config.WhichOneof("model")
+  meta_architecture_config = getattr(model_config, meta_architecture)
+
+  if hasattr(meta_architecture_config, "context_config"):
+    return meta_architecture_config.context_config.max_num_context_features
+
+
+def get_context_feature_length(model_config):
+  """Returns context feature length from a given config.
+
+  Args:
+    model_config: A model config file.
+
+  Returns:
+    An integer specifying the fixed length of each feature in context_features.
+  """
+  meta_architecture = model_config.WhichOneof("model")
+  meta_architecture_config = getattr(model_config, meta_architecture)
+
+  if hasattr(meta_architecture_config, "context_config"):
+    return meta_architecture_config.context_config.context_feature_length
+
+
+def get_configs_from_pipeline_file(pipeline_config_path, config_override=None):
   """Reads config from a file containing pipeline_pb2.TrainEvalPipelineConfig.
 
   Args:
     pipeline_config_path: Path to pipeline_pb2.TrainEvalPipelineConfig text
       proto.
+    config_override: A pipeline_pb2.TrainEvalPipelineConfig text proto to
+      override pipeline_config_path.
 
   Returns:
     Dictionary of configuration objects. Keys are `model`, `train_config`,
@@ -92,7 +137,38 @@ def get_configs_from_pipeline_file(pipeline_config_path):
   with tf.gfile.GFile(pipeline_config_path, "r") as f:
     proto_str = f.read()
     text_format.Merge(proto_str, pipeline_config)
+  if config_override:
+    text_format.Merge(config_override, pipeline_config)
   return create_configs_from_pipeline_proto(pipeline_config)
+
+
+def clear_fine_tune_checkpoint(pipeline_config_path,
+                               new_pipeline_config_path):
+  """Clears fine_tune_checkpoint and writes a new pipeline config file."""
+  configs = get_configs_from_pipeline_file(pipeline_config_path)
+  configs["train_config"].fine_tune_checkpoint = ""
+  configs["train_config"].load_all_detection_checkpoint_vars = False
+  pipeline_proto = create_pipeline_proto_from_configs(configs)
+  with tf.gfile.Open(new_pipeline_config_path, "wb") as f:
+    f.write(text_format.MessageToString(pipeline_proto))
+
+
+def update_fine_tune_checkpoint_type(train_config):
+  """Set `fine_tune_checkpoint_type` using `from_detection_checkpoint`.
+
+  `train_config.from_detection_checkpoint` field is deprecated. For backward
+  compatibility, this function sets `train_config.fine_tune_checkpoint_type`
+  based on `train_config.from_detection_checkpoint`.
+
+  Args:
+    train_config: train_pb2.TrainConfig proto object.
+
+  """
+  if not train_config.fine_tune_checkpoint_type:
+    if train_config.from_detection_checkpoint:
+      train_config.fine_tune_checkpoint_type = "detection"
+    else:
+      train_config.fine_tune_checkpoint_type = "classification"
 
 
 def create_configs_from_pipeline_proto(pipeline_config):
@@ -103,15 +179,20 @@ def create_configs_from_pipeline_proto(pipeline_config):
 
   Returns:
     Dictionary of configuration objects. Keys are `model`, `train_config`,
-      `train_input_config`, `eval_config`, `eval_input_config`. Value are the
-      corresponding config objects.
+      `train_input_config`, `eval_config`, `eval_input_configs`. Value are
+      the corresponding config objects or list of config objects (only for
+      eval_input_configs).
   """
   configs = {}
   configs["model"] = pipeline_config.model
   configs["train_config"] = pipeline_config.train_config
   configs["train_input_config"] = pipeline_config.train_input_reader
   configs["eval_config"] = pipeline_config.eval_config
-  configs["eval_input_config"] = pipeline_config.eval_input_reader
+  configs["eval_input_configs"] = pipeline_config.eval_input_reader
+  # Keeps eval_input_config only for backwards compatibility. All clients should
+  # read eval_input_configs instead.
+  if configs["eval_input_configs"]:
+    configs["eval_input_config"] = configs["eval_input_configs"][0]
   if pipeline_config.HasField("graph_rewriter"):
     configs["graph_rewriter_config"] = pipeline_config.graph_rewriter
 
@@ -150,7 +231,7 @@ def create_pipeline_proto_from_configs(configs):
   pipeline_config.train_config.CopyFrom(configs["train_config"])
   pipeline_config.train_input_reader.CopyFrom(configs["train_input_config"])
   pipeline_config.eval_config.CopyFrom(configs["eval_config"])
-  pipeline_config.eval_input_reader.CopyFrom(configs["eval_input_config"])
+  pipeline_config.eval_input_reader.extend(configs["eval_input_configs"])
   if "graph_rewriter_config" in configs:
     pipeline_config.graph_rewriter.CopyFrom(configs["graph_rewriter_config"])
   return pipeline_config
@@ -224,7 +305,7 @@ def get_configs_from_multiple_files(model_config_path="",
     eval_input_config = input_reader_pb2.InputReader()
     with tf.gfile.GFile(eval_input_config_path, "r") as f:
       text_format.Merge(f.read(), eval_input_config)
-      configs["eval_input_config"] = eval_input_config
+      configs["eval_input_configs"] = [eval_input_config]
 
   if graph_rewriter_config_path:
     configs["graph_rewriter_config"] = get_graph_rewriter_config_from_file(
@@ -246,12 +327,12 @@ def get_number_of_classes(model_config):
     ValueError: If the model type is not recognized.
   """
   meta_architecture = model_config.WhichOneof("model")
-  if meta_architecture == "faster_rcnn":
-    return model_config.faster_rcnn.num_classes
-  if meta_architecture == "ssd":
-    return model_config.ssd.num_classes
+  meta_architecture_config = getattr(model_config, meta_architecture)
 
-  raise ValueError("Expected the model to be one of 'faster_rcnn' or 'ssd'.")
+  if hasattr(meta_architecture_config, "num_classes"):
+    return meta_architecture_config.num_classes
+  else:
+    raise ValueError("{} does not have num_classes.".format(meta_architecture))
 
 
 def get_optimizer_type(train_config):
@@ -284,14 +365,127 @@ def _is_generic_key(key):
       "graph_rewriter_config",
       "model",
       "train_input_config",
-      "train_input_config",
-      "train_config"]:
+      "train_config",
+      "eval_config"]:
     if key.startswith(prefix + "."):
       return True
   return False
 
 
-def merge_external_params_with_configs(configs, hparams=None, **kwargs):
+def _check_and_convert_legacy_input_config_key(key):
+  """Checks key and converts legacy input config update to specific update.
+
+  Args:
+    key: string indicates the target of update operation.
+
+  Returns:
+    is_valid_input_config_key: A boolean indicating whether the input key is to
+      update input config(s).
+    key_name: 'eval_input_configs' or 'train_input_config' string if
+      is_valid_input_config_key is true. None if is_valid_input_config_key is
+      false.
+    input_name: always returns None since legacy input config key never
+      specifies the target input config. Keeping this output only to match the
+      output form defined for input config update.
+    field_name: the field name in input config. `key` itself if
+      is_valid_input_config_key is false.
+  """
+  key_name = None
+  input_name = None
+  field_name = key
+  is_valid_input_config_key = True
+  if field_name == "train_shuffle":
+    key_name = "train_input_config"
+    field_name = "shuffle"
+  elif field_name == "eval_shuffle":
+    key_name = "eval_input_configs"
+    field_name = "shuffle"
+  elif field_name == "train_input_path":
+    key_name = "train_input_config"
+    field_name = "input_path"
+  elif field_name == "eval_input_path":
+    key_name = "eval_input_configs"
+    field_name = "input_path"
+  elif field_name == "append_train_input_path":
+    key_name = "train_input_config"
+    field_name = "input_path"
+  elif field_name == "append_eval_input_path":
+    key_name = "eval_input_configs"
+    field_name = "input_path"
+  else:
+    is_valid_input_config_key = False
+
+  return is_valid_input_config_key, key_name, input_name, field_name
+
+
+def check_and_parse_input_config_key(configs, key):
+  """Checks key and returns specific fields if key is valid input config update.
+
+  Args:
+    configs: Dictionary of configuration objects. See outputs from
+      get_configs_from_pipeline_file() or get_configs_from_multiple_files().
+    key: string indicates the target of update operation.
+
+  Returns:
+    is_valid_input_config_key: A boolean indicate whether the input key is to
+      update input config(s).
+    key_name: 'eval_input_configs' or 'train_input_config' string if
+      is_valid_input_config_key is true. None if is_valid_input_config_key is
+      false.
+    input_name: the name of the input config to be updated. None if
+      is_valid_input_config_key is false.
+    field_name: the field name in input config. `key` itself if
+      is_valid_input_config_key is false.
+
+  Raises:
+    ValueError: when the input key format doesn't match any known formats.
+    ValueError: if key_name doesn't match 'eval_input_configs' or
+      'train_input_config'.
+    ValueError: if input_name doesn't match any name in train or eval input
+      configs.
+    ValueError: if field_name doesn't match any supported fields.
+  """
+  key_name = None
+  input_name = None
+  field_name = None
+  fields = key.split(":")
+  if len(fields) == 1:
+    field_name = key
+    return _check_and_convert_legacy_input_config_key(key)
+  elif len(fields) == 3:
+    key_name = fields[0]
+    input_name = fields[1]
+    field_name = fields[2]
+  else:
+    raise ValueError("Invalid key format when overriding configs.")
+
+  # Checks if key_name is valid for specific update.
+  if key_name not in ["eval_input_configs", "train_input_config"]:
+    raise ValueError("Invalid key_name when overriding input config.")
+
+  # Checks if input_name is valid for specific update. For train input config it
+  # should match configs[key_name].name, for eval input configs it should match
+  # the name field of one of the eval_input_configs.
+  if isinstance(configs[key_name], input_reader_pb2.InputReader):
+    is_valid_input_name = configs[key_name].name == input_name
+  else:
+    is_valid_input_name = input_name in [
+        eval_input_config.name for eval_input_config in configs[key_name]
+    ]
+  if not is_valid_input_name:
+    raise ValueError("Invalid input_name when overriding input config.")
+
+  # Checks if field_name is valid for specific update.
+  if field_name not in [
+      "input_path", "label_map_path", "shuffle", "mask_type",
+      "sample_1_of_n_examples"
+  ]:
+    raise ValueError("Invalid field_name when overriding input config.")
+
+  return True, key_name, input_name, field_name
+
+
+def merge_external_params_with_configs(configs, hparams=None, kwargs_dict=None):
   """Updates `configs` dictionary based on supplied parameters.
 
   This utility is for modifying specific fields in the object detection configs.
@@ -304,6 +498,31 @@ def merge_external_params_with_configs(configs, hparams=None, **kwargs):
   1. Strategy-based overrides, which update multiple relevant configuration
   options. For example, updating `learning_rate` will update both the warmup and
   final learning rates.
+  In this case key can be one of the following formats:
+      1. legacy update: single string that indicates the attribute to be
+        updated. E.g. 'label_map_path', 'eval_input_path', 'shuffle'.
+        Note that when updating fields (e.g. eval_input_path, eval_shuffle) in
+        eval_input_configs, the override will only be applied when
+        eval_input_configs has exactly 1 element.
+      2. specific update: colon separated string that indicates which field in
+        which input_config to update. It should have 3 fields:
+        - key_name: Name of the input config we should update, either
+          'train_input_config' or 'eval_input_configs'
+        - input_name: a 'name' that can be used to identify elements, especially
+          when configs[key_name] is a repeated field.
+        - field_name: name of the field that you want to override.
+        For example, given configs dict as below:
+          configs = {
+            'model': {...}
+            'train_config': {...}
+            'train_input_config': {...}
+            'eval_config': {...}
+            'eval_input_configs': [{ name:"eval_coco", ...},
+                                   { name:"eval_voc", ... }]
+          }
+        Assume we want to update the input_path of the eval_input_config
+        whose name is 'eval_coco'. The `key` would then be:
+        'eval_input_configs:eval_coco:input_path'
   2. Generic key/value, which update a specific parameter based on namespaced
   configuration keys. For example,
   `model.ssd.loss.hard_example_miner.max_negatives_per_positive` will update the
@@ -314,60 +533,205 @@ def merge_external_params_with_configs(configs, hparams=None, **kwargs):
     configs: Dictionary of configuration objects. See outputs from
       get_configs_from_pipeline_file() or get_configs_from_multiple_files().
     hparams: A `HParams`.
-    **kwargs: Extra keyword arguments that are treated the same way as
+    kwargs_dict: Extra keyword arguments that are treated the same way as
       attribute/value pairs in `hparams`. Note that hyperparameters with the
       same names will override keyword arguments.
 
   Returns:
     `configs` dictionary.
+
+  Raises:
+    ValueError: when the key string doesn't match any of its allowed formats.
   """
 
+  if kwargs_dict is None:
+    kwargs_dict = {}
   if hparams:
-    kwargs.update(hparams.values())
-  for key, value in kwargs.items():
+    kwargs_dict.update(hparams.values())
+  for key, value in kwargs_dict.items():
     tf.logging.info("Maybe overwriting %s: %s", key, value)
     # pylint: disable=g-explicit-bool-comparison
     if value == "" or value is None:
       continue
     # pylint: enable=g-explicit-bool-comparison
-    if key == "learning_rate":
-      _update_initial_learning_rate(configs, value)
-    elif key == "batch_size":
-      _update_batch_size(configs, value)
-    elif key == "momentum_optimizer_value":
-      _update_momentum_optimizer_value(configs, value)
-    elif key == "classification_localization_weight_ratio":
-      # Localization weight is fixed to 1.0.
-      _update_classification_localization_weight_ratio(configs, value)
-    elif key == "focal_loss_gamma":
-      _update_focal_loss_gamma(configs, value)
-    elif key == "focal_loss_alpha":
-      _update_focal_loss_alpha(configs, value)
-    elif key == "train_steps":
-      _update_train_steps(configs, value)
-    elif key == "eval_steps":
-      _update_eval_steps(configs, value)
-    elif key == "train_input_path":
-      _update_input_path(configs["train_input_config"], value)
-    elif key == "eval_input_path":
-      _update_input_path(configs["eval_input_config"], value)
-    elif key == "label_map_path":
-      _update_label_map_path(configs, value)
-    elif key == "mask_type":
-      _update_mask_type(configs, value)
-    elif key == "eval_with_moving_averages":
-      _update_use_moving_averages(configs, value)
-    elif key == "train_shuffle":
-      _update_shuffle(configs["train_input_config"], value)
-    elif key == "eval_shuffle":
-      _update_shuffle(configs["eval_input_config"], value)
-    elif key == "retain_original_images_in_eval":
-      _update_retain_original_images(configs["eval_config"], value)
+    elif _maybe_update_config_with_key_value(configs, key, value):
+      continue
     elif _is_generic_key(key):
       _update_generic(configs, key, value)
     else:
       tf.logging.info("Ignoring config override key: %s", key)
   return configs
+
+
+def _maybe_update_config_with_key_value(configs, key, value):
+  """Checks key type and updates `configs` with the key value pair accordingly.
+
+  Args:
+    configs: Dictionary of configuration objects. See outputs from
+      get_configs_from_pipeline_file() or get_configs_from_multiple_files().
+    key: String indicates the field(s) to be updated.
+    value: Value used to override existing field value.
+
+  Returns:
+    A boolean value that indicates whether the override succeeds.
+
+  Raises:
+    ValueError: when the key string doesn't match any of the formats above.
+  """
+  is_valid_input_config_key, key_name, input_name, field_name = (
+      check_and_parse_input_config_key(configs, key))
+  if is_valid_input_config_key:
+    update_input_reader_config(
+        configs,
+        key_name=key_name,
+        input_name=input_name,
+        field_name=field_name,
+        value=value)
+  elif field_name == "learning_rate":
+    _update_initial_learning_rate(configs, value)
+  elif field_name == "batch_size":
+    _update_batch_size(configs, value)
+  elif field_name == "momentum_optimizer_value":
+    _update_momentum_optimizer_value(configs, value)
+  elif field_name == "classification_localization_weight_ratio":
+    # Localization weight is fixed to 1.0.
+    _update_classification_localization_weight_ratio(configs, value)
+  elif field_name == "focal_loss_gamma":
+    _update_focal_loss_gamma(configs, value)
+  elif field_name == "focal_loss_alpha":
+    _update_focal_loss_alpha(configs, value)
+  elif field_name == "train_steps":
+    _update_train_steps(configs, value)
+  elif field_name == "label_map_path":
+    _update_label_map_path(configs, value)
+  elif field_name == "mask_type":
+    _update_mask_type(configs, value)
+  elif field_name == "sample_1_of_n_eval_examples":
+    _update_all_eval_input_configs(configs, "sample_1_of_n_examples", value)
+  elif field_name == "eval_num_epochs":
+    _update_all_eval_input_configs(configs, "num_epochs", value)
+  elif field_name == "eval_with_moving_averages":
+    _update_use_moving_averages(configs, value)
+  elif field_name == "retain_original_images_in_eval":
+    _update_retain_original_images(configs["eval_config"], value)
+  elif field_name == "use_bfloat16":
+    _update_use_bfloat16(configs, value)
+  elif field_name == "retain_original_image_additional_channels_in_eval":
+    _update_retain_original_image_additional_channels(configs["eval_config"],
+                                                      value)
+  elif field_name == "num_classes":
+    _update_num_classes(configs["model"], value)
+  elif field_name == "sample_from_datasets_weights":
+    _update_sample_from_datasets_weights(configs["train_input_config"], value)
+  elif field_name == "peak_max_pool_kernel_size":
+    _update_peak_max_pool_kernel_size(configs["model"], value)
+  elif field_name == "candidate_search_scale":
+    _update_candidate_search_scale(configs["model"], value)
+  elif field_name == "candidate_ranking_mode":
+    _update_candidate_ranking_mode(configs["model"], value)
+  elif field_name == "score_distance_offset":
+    _update_score_distance_offset(configs["model"], value)
+  elif field_name == "box_scale":
+    _update_box_scale(configs["model"], value)
+  elif field_name == "keypoint_candidate_score_threshold":
+    _update_keypoint_candidate_score_threshold(configs["model"], value)
+  elif field_name == "rescore_instances":
+    _update_rescore_instances(configs["model"], value)
+  elif field_name == "unmatched_keypoint_score":
+    _update_unmatched_keypoint_score(configs["model"], value)
+  elif field_name == "score_distance_multiplier":
+    _update_score_distance_multiplier(configs["model"], value)
+  elif field_name == "std_dev_multiplier":
+    _update_std_dev_multiplier(configs["model"], value)
+  elif field_name == "rescoring_threshold":
+    _update_rescoring_threshold(configs["model"], value)
+  else:
+    return False
+  return True
+
+
+def _update_tf_record_input_path(input_config, input_path):
+  """Updates input configuration to reflect a new input path.
+
+  The input_config object is updated in place, and hence not returned.
+
+  Args:
+    input_config: A input_reader_pb2.InputReader.
+    input_path: A path to data or list of paths.
+
+  Raises:
+    TypeError: if input reader type is not `tf_record_input_reader`.
+  """
+  input_reader_type = input_config.WhichOneof("input_reader")
+  if input_reader_type == "tf_record_input_reader":
+    input_config.tf_record_input_reader.ClearField("input_path")
+    if isinstance(input_path, list):
+      input_config.tf_record_input_reader.input_path.extend(input_path)
+    else:
+      input_config.tf_record_input_reader.input_path.append(input_path)
+  else:
+    raise TypeError("Input reader type must be `tf_record_input_reader`.")
+
+
+def update_input_reader_config(configs,
+                               key_name=None,
+                               input_name=None,
+                               field_name=None,
+                               value=None,
+                               path_updater=_update_tf_record_input_path):
+  """Updates specified input reader config field.
+
+  Args:
+    configs: Dictionary of configuration objects. See outputs from
+      get_configs_from_pipeline_file() or get_configs_from_multiple_files().
+    key_name: Name of the input config we should update, either
+      'train_input_config' or 'eval_input_configs'
+    input_name: String name used to identify input config to update with. Should
+      be either None or value of the 'name' field in one of the input reader
+      configs.
+    field_name: Field name in input_reader_pb2.InputReader.
+    value: Value used to override existing field value.
+    path_updater: helper function used to update the input path. Only used when
+      field_name is "input_path".
+
+  Raises:
+    ValueError: when input field_name is None.
+    ValueError: when input_name is None and number of eval_input_readers does
+      not equal to 1.
+  """
+  if isinstance(configs[key_name], input_reader_pb2.InputReader):
+    # Updates singular input_config object.
+    target_input_config = configs[key_name]
+    if field_name == "input_path":
+      path_updater(input_config=target_input_config, input_path=value)
+    else:
+      setattr(target_input_config, field_name, value)
+  elif input_name is None and len(configs[key_name]) == 1:
+    # Updates first (and the only) object of input_config list.
+    target_input_config = configs[key_name][0]
+    if field_name == "input_path":
+      path_updater(input_config=target_input_config, input_path=value)
+    else:
+      setattr(target_input_config, field_name, value)
+  elif input_name is not None and len(configs[key_name]):
+    # Updates input_config whose name matches input_name.
+    update_count = 0
+    for input_config in configs[key_name]:
+      if input_config.name == input_name:
+        setattr(input_config, field_name, value)
+        update_count = update_count + 1
+    if not update_count:
+      raise ValueError(
+          "Input name {} not found when overriding.".format(input_name))
+    elif update_count > 1:
+      raise ValueError("Duplicate input name found when overriding.")
+  else:
+    key_name = "None" if key_name is None else key_name
+    input_name = "None" if input_name is None else input_name
+    field_name = "None" if field_name is None else field_name
+    raise ValueError("Unknown input config overriding: "
+                     "key_name:{}, input_name:{}, field_name:{}.".format(
+                         key_name, input_name, field_name))
 
 
 def _update_initial_learning_rate(configs, learning_rate):
@@ -591,32 +955,10 @@ def _update_train_steps(configs, train_steps):
   configs["train_config"].num_steps = int(train_steps)
 
 
-def _update_eval_steps(configs, eval_steps):
-  """Updates `configs` to reflect new number of eval steps per evaluation."""
-  configs["eval_config"].num_examples = int(eval_steps)
-
-
-def _update_input_path(input_config, input_path):
-  """Updates input configuration to reflect a new input path.
-
-  The input_config object is updated in place, and hence not returned.
-
-  Args:
-    input_config: A input_reader_pb2.InputReader.
-    input_path: A path to data or list of paths.
-
-  Raises:
-    TypeError: if input reader type is not `tf_record_input_reader`.
-  """
-  input_reader_type = input_config.WhichOneof("input_reader")
-  if input_reader_type == "tf_record_input_reader":
-    input_config.tf_record_input_reader.ClearField("input_path")
-    if isinstance(input_path, list):
-      input_config.tf_record_input_reader.input_path.extend(input_path)
-    else:
-      input_config.tf_record_input_reader.input_path.append(input_path)
-  else:
-    raise TypeError("Input reader type must be `tf_record_input_reader`.")
+def _update_all_eval_input_configs(configs, field, value):
+  """Updates the content of `field` with `value` for all eval input configs."""
+  for eval_input_config in configs["eval_input_configs"]:
+    setattr(eval_input_config, field, value)
 
 
 def _update_label_map_path(configs, label_map_path):
@@ -630,7 +972,9 @@ def _update_label_map_path(configs, label_map_path):
     label_map_path: New path to `StringIntLabelMap` pbtxt file.
   """
   configs["train_input_config"].label_map_path = label_map_path
-  configs["eval_input_config"].label_map_path = label_map_path
+  _update_all_eval_input_configs(configs, "label_map_path", label_map_path)
+
+
 
 
 def _update_mask_type(configs, mask_type):
@@ -645,7 +989,7 @@ def _update_mask_type(configs, mask_type):
       input_reader_pb2.InstanceMaskType
   """
   configs["train_input_config"].mask_type = mask_type
-  configs["eval_input_config"].mask_type = mask_type
+  _update_all_eval_input_configs(configs, "mask_type", mask_type)
 
 
 def _update_use_moving_averages(configs, use_moving_averages):
@@ -662,18 +1006,6 @@ def _update_use_moving_averages(configs, use_moving_averages):
   configs["eval_config"].use_moving_averages = use_moving_averages
 
 
-def _update_shuffle(input_config, shuffle):
-  """Updates input configuration to reflect a new shuffle configuration.
-
-  The input_config object is updated in place, and hence not returned.
-
-  Args:
-    input_config: A input_reader_pb2.InputReader.
-    shuffle: Whether or not to shuffle the input data before reading.
-  """
-  input_config.shuffle = shuffle
-
-
 def _update_retain_original_images(eval_config, retain_original_images):
   """Updates eval config with option to retain original images.
 
@@ -685,3 +1017,255 @@ def _update_retain_original_images(eval_config, retain_original_images):
       in eval mode.
   """
   eval_config.retain_original_images = retain_original_images
+
+
+def _update_use_bfloat16(configs, use_bfloat16):
+  """Updates `configs` to reflect the new setup on whether to use bfloat16.
+
+  The configs dictionary is updated in place, and hence not returned.
+
+  Args:
+    configs: Dictionary of configuration objects. See outputs from
+      get_configs_from_pipeline_file() or get_configs_from_multiple_files().
+    use_bfloat16: A bool, indicating whether to use bfloat16 for training.
+  """
+  configs["train_config"].use_bfloat16 = use_bfloat16
+
+
+def _update_retain_original_image_additional_channels(
+    eval_config,
+    retain_original_image_additional_channels):
+  """Updates eval config to retain original image additional channels or not.
+
+  The eval_config object is updated in place, and hence not returned.
+
+  Args:
+    eval_config: A eval_pb2.EvalConfig.
+    retain_original_image_additional_channels: Boolean indicating whether to
+      retain original image additional channels in eval mode.
+  """
+  eval_config.retain_original_image_additional_channels = (
+      retain_original_image_additional_channels)
+
+
+def remove_unnecessary_ema(variables_to_restore, no_ema_collection=None):
+  """Remap and Remove EMA variable that are not created during training.
+
+  ExponentialMovingAverage.variables_to_restore() returns a map of EMA names
+  to tf variables to restore. E.g.:
+  {
+      conv/batchnorm/gamma/ExponentialMovingAverage: conv/batchnorm/gamma,
+      conv_4/conv2d_params/ExponentialMovingAverage: conv_4/conv2d_params,
+      global_step: global_step
+  }
+  This function takes care of the extra ExponentialMovingAverage variables
+  that get created during eval but aren't available in the checkpoint, by
+  remapping the key to the variable itself, and remove the entry of its EMA from
+  the variables to restore. An example resulting dictionary would look like:
+  {
+      conv/batchnorm/gamma: conv/batchnorm/gamma,
+      conv_4/conv2d_params: conv_4/conv2d_params,
+      global_step: global_step
+  }
+  Args:
+    variables_to_restore: A dictionary created by ExponentialMovingAverage.
+      variables_to_restore().
+    no_ema_collection: A list of namescope substrings to match the variables
+      to eliminate EMA.
+
+  Returns:
+    A variables_to_restore dictionary excluding the collection of unwanted
+    EMA mapping.
+  """
+  if no_ema_collection is None:
+    return variables_to_restore
+
+  restore_map = {}
+  for key in variables_to_restore:
+    if ("ExponentialMovingAverage" in key
+        and any([name in key for name in no_ema_collection])):
+      new_key = key.replace("/ExponentialMovingAverage", "")
+    else:
+      new_key = key
+    restore_map[new_key] = variables_to_restore[key]
+  return restore_map
+
+
+def _update_num_classes(model_config, num_classes):
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "faster_rcnn":
+    model_config.faster_rcnn.num_classes = num_classes
+  if meta_architecture == "ssd":
+    model_config.ssd.num_classes = num_classes
+
+
+def _update_sample_from_datasets_weights(input_reader_config, weights):
+  """Updated sample_from_datasets_weights with overrides."""
+  if len(weights) != len(input_reader_config.sample_from_datasets_weights):
+    raise ValueError(
+        "sample_from_datasets_weights override has a different number of values"
+        " ({}) than the configured dataset weights ({})."
+        .format(
+            len(input_reader_config.sample_from_datasets_weights),
+            len(weights)))
+
+  del input_reader_config.sample_from_datasets_weights[:]
+  input_reader_config.sample_from_datasets_weights.extend(weights)
+
+
+def _update_peak_max_pool_kernel_size(model_config, kernel_size):
+  """Updates the max pool kernel size (NMS) for keypoints in CenterNet."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.peak_max_pool_kernel_size = kernel_size
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "peak_max_pool_kernel_size since there are multiple "
+                         "keypoint estimation tasks")
+
+
+def _update_candidate_search_scale(model_config, search_scale):
+  """Updates the keypoint candidate search scale in CenterNet."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.candidate_search_scale = search_scale
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "candidate_search_scale since there are multiple "
+                         "keypoint estimation tasks")
+
+
+def _update_candidate_ranking_mode(model_config, mode):
+  """Updates how keypoints are snapped to candidates in CenterNet."""
+  if mode not in ("min_distance", "score_distance_ratio",
+                  "score_scaled_distance_ratio", "gaussian_weighted"):
+    raise ValueError("Attempting to set the keypoint candidate ranking mode "
+                     "to {}, but the only options are 'min_distance', "
+                     "'score_distance_ratio', 'score_scaled_distance_ratio', "
+                     "'gaussian_weighted'.".format(mode))
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.candidate_ranking_mode = mode
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "candidate_ranking_mode since there are multiple "
+                         "keypoint estimation tasks")
+
+
+def _update_score_distance_offset(model_config, offset):
+  """Updates the keypoint candidate selection metric. See CenterNet proto."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.score_distance_offset = offset
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "score_distance_offset since there are multiple "
+                         "keypoint estimation tasks")
+
+
+def _update_box_scale(model_config, box_scale):
+  """Updates the keypoint candidate search region. See CenterNet proto."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.box_scale = box_scale
+    else:
+      tf.logging.warning("Ignoring config override key for box_scale since "
+                         "there are multiple keypoint estimation tasks")
+
+
+def _update_keypoint_candidate_score_threshold(model_config, threshold):
+  """Updates the keypoint candidate score threshold. See CenterNet proto."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.keypoint_candidate_score_threshold = threshold
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "keypoint_candidate_score_threshold since there are "
+                         "multiple keypoint estimation tasks")
+
+
+def _update_rescore_instances(model_config, should_rescore):
+  """Updates whether boxes should be rescored based on keypoint confidences."""
+  if isinstance(should_rescore, str):
+    should_rescore = True if should_rescore == "True" else False
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.rescore_instances = should_rescore
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "rescore_instances since there are multiple keypoint "
+                         "estimation tasks")
+
+
+def _update_unmatched_keypoint_score(model_config, score):
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.unmatched_keypoint_score = score
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "unmatched_keypoint_score since there are multiple "
+                         "keypoint estimation tasks")
+
+
+def _update_score_distance_multiplier(model_config, score_distance_multiplier):
+  """Updates the keypoint candidate selection metric. See CenterNet proto."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.score_distance_multiplier = score_distance_multiplier
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "score_distance_multiplier since there are multiple "
+                         "keypoint estimation tasks")
+  else:
+    raise ValueError(
+        "Unsupported meta_architecture type: %s" % meta_architecture)
+
+
+def _update_std_dev_multiplier(model_config, std_dev_multiplier):
+  """Updates the keypoint candidate selection metric. See CenterNet proto."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.std_dev_multiplier = std_dev_multiplier
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "std_dev_multiplier since there are multiple "
+                         "keypoint estimation tasks")
+  else:
+    raise ValueError(
+        "Unsupported meta_architecture type: %s" % meta_architecture)
+
+
+def _update_rescoring_threshold(model_config, rescoring_threshold):
+  """Updates the keypoint candidate selection metric. See CenterNet proto."""
+  meta_architecture = model_config.WhichOneof("model")
+  if meta_architecture == "center_net":
+    if len(model_config.center_net.keypoint_estimation_task) == 1:
+      kpt_estimation_task = model_config.center_net.keypoint_estimation_task[0]
+      kpt_estimation_task.rescoring_threshold = rescoring_threshold
+    else:
+      tf.logging.warning("Ignoring config override key for "
+                         "rescoring_threshold since there are multiple "
+                         "keypoint estimation tasks")
+  else:
+    raise ValueError(
+        "Unsupported meta_architecture type: %s" % meta_architecture)
